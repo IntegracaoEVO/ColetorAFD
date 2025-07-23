@@ -24,13 +24,17 @@ class EvoFacialServer:
         self.collector_thread = None
         self.port = 8080
         self.auto_save = BooleanVar(value=True)
-        self.collection_interval = 30  # 5 minutos padrão
+        self.collection_interval = 30  # 30 segundos padrão
         self.running = False
-        self.collected_logs = set()
+        
+        # Controle de logs por dispositivo - CORREÇÃO PRINCIPAL
+        self.device_logs = {}  # {sn: {log_hash: True}}
         
         # Persistência de NSR
         self.nsr_file = "nsr_counters.json"
+        self.logs_control_file = "logs_control.json"
         self.saved_nsr = self.load_nsr_counters()
+        self.load_logs_control()
         
         # Interface
         self.notebook = ttk.Notebook(self.root)
@@ -98,8 +102,16 @@ class EvoFacialServer:
             width=20
         ).grid(column=1, row=2, columnspan=2, pady=10)
         
+        # Botão para limpar controle de logs
+        ttk.Button(
+            frame,
+            text="Limpar Controle de Logs",
+            command=self.clear_logs_control,
+            width=20
+        ).grid(column=1, row=3, columnspan=2, pady=5)
+        
         self.config_status = StringVar()
-        ttk.Label(frame, textvariable=self.config_status).grid(column=1, row=3, columnspan=2)
+        ttk.Label(frame, textvariable=self.config_status).grid(column=1, row=4, columnspan=2)
 
     def setup_nsr_tab(self):
         frame = ttk.Frame(self.notebook)
@@ -164,6 +176,35 @@ class EvoFacialServer:
                 json.dump(self.saved_nsr, f)
         except Exception as e:
             print(f"Erro ao salvar contadores: {e}")
+
+    def load_logs_control(self):
+        """Carrega controle de logs já processados"""
+        try:
+            if os.path.exists(self.logs_control_file):
+                with open(self.logs_control_file, 'r') as f:
+                    self.device_logs = json.load(f)
+            else:
+                self.device_logs = {}
+        except:
+            self.device_logs = {}
+
+    def save_logs_control(self):
+        """Salva controle de logs já processados"""
+        try:
+            with open(self.logs_control_file, 'w') as f:
+                json.dump(self.device_logs, f)
+        except Exception as e:
+            print(f"Erro ao salvar controle de logs: {e}")
+
+    def clear_logs_control(self):
+        """Limpa o controle de logs (permitirá reprocessar todos os logs)"""
+        self.device_logs = {}
+        try:
+            if os.path.exists(self.logs_control_file):
+                os.remove(self.logs_control_file)
+            self.config_status.set("Controle de logs limpo com sucesso!")
+        except Exception as e:
+            self.config_status.set(f"Erro ao limpar controle: {e}")
 
     def get_nsr_counter(self, sn):
         return self.saved_nsr.get(sn, 1)
@@ -326,15 +367,30 @@ class EvoFacialServer:
         self.update_nsr_display()
 
     def get_log_hash(self, record):
-        return hash((
+        """Gera hash único para cada registro de log"""
+        return str(hash((
             record.get("enrollid"),
             record.get("time"),
-            record.get("mode"),
-            record.get("event")
-        ))
+            record.get("mode", ""),
+            record.get("event", "")
+        )))
+
+    def is_log_already_processed(self, sn, log_hash):
+        """Verifica se o log já foi processado para este dispositivo"""
+        if sn not in self.device_logs:
+            self.device_logs[sn] = {}
+        return log_hash in self.device_logs[sn]
+
+    def mark_log_as_processed(self, sn, log_hash):
+        """Marca o log como processado para este dispositivo"""
+        if sn not in self.device_logs:
+            self.device_logs[sn] = {}
+        self.device_logs[sn][log_hash] = True
+        self.save_logs_control()
 
     async def handle_connection(self, websocket, path):
         device_info = None
+        sn = None
         
         try:
             message = await websocket.recv()
@@ -380,17 +436,23 @@ class EvoFacialServer:
                         self.update_devices_list()
                         
                         if data.get("ret") in ["getnewlog", "getalllog"] and data.get("result"):
-                            new_records = [
-                                record for record in data.get("record", []) 
-                                if self.get_log_hash(record) not in self.collected_logs
-                            ]
+                            # Filtra apenas registros não processados
+                            new_records = []
+                            for record in data.get("record", []):
+                                log_hash = self.get_log_hash(record)
+                                if not self.is_log_already_processed(sn, log_hash):
+                                    new_records.append(record)
+                                    self.mark_log_as_processed(sn, log_hash)
                             
                             if new_records:
-                                self.collected_logs.update(self.get_log_hash(r) for r in new_records)
+                                print(f"Processando {len(new_records)} novos registros para {sn}")
                                 filtered_data = data.copy()
                                 filtered_data["record"] = new_records
                                 self.save_to_afd(sn, filtered_data)
+                            else:
+                                print(f"Nenhum registro novo para {sn}")
                             
+                            # Responde ao equipamento
                             if data.get("count", 0) > len(data.get("record", [])):
                                 response = {
                                     "ret": data["ret"],
@@ -406,31 +468,25 @@ class EvoFacialServer:
         except Exception as e:
             print(f"Erro na conexão: {e}")
         finally:
-            if device_info:
-                sn = data.get("sn", "Desconhecido")
-                if sn in self.connected_devices:
-                    del self.connected_devices[sn]
-                    self.update_devices_list()
-                    self.update_nsr_display()
+            if sn and sn in self.connected_devices:
+                del self.connected_devices[sn]
+                self.update_devices_list()
+                self.update_nsr_display()
 
     def save_to_afd(self, sn, log_data):
         filename = f"AFD{sn}.txt"
-        
-        # Lê registros existentes
-        existing_records = []
-        try:
-            with open(filename, "r", encoding='utf-8') as f:
-                existing_records = [line.strip() for line in f if line.strip()]
-        except FileNotFoundError:
-            pass
         
         # Processa novos registros
         new_records = []
         if "record" in log_data:
             for record in log_data["record"]:
-                new_records.append(self.format_afd_record(record, sn))
+                # Incrementa NSR para cada novo registro
                 current_nsr = self.increment_nsr_counter(sn)
                 self.connected_devices[sn]["nsr_counter"] = current_nsr
+                
+                # Formata registro AFD
+                afd_record = self.format_afd_record(record, sn, current_nsr)
+                new_records.append(afd_record)
                 
                 # Sincroniza NSR com equipamento
                 try:
@@ -441,18 +497,40 @@ class EvoFacialServer:
                 except Exception as e:
                     print(f"Erro ao sincronizar NSR com {sn}: {e}")
         
-        # Combina e ordena
-        all_records = existing_records + new_records
-        all_records.sort(key=lambda x: x.split('3')[1][:19])
-        
-        # Reescreve arquivo
-        with open(filename, "w", encoding='utf-8') as f:
-            f.write("\n".join(all_records) + "\n")
+        if new_records:
+            # Lê registros existentes
+            existing_records = []
+            try:
+                with open(filename, "r", encoding='utf-8') as f:
+                    existing_records = [line.strip() for line in f if line.strip()]
+            except FileNotFoundError:
+                pass
+            
+            # Combina e ordena por timestamp
+            all_records = existing_records + new_records
+            all_records.sort(key=lambda x: self.extract_timestamp_from_afd(x))
+            
+            # Reescreve arquivo
+            with open(filename, "w", encoding='utf-8') as f:
+                for record in all_records:
+                    f.write(record + "\n")
+            
+            print(f"Salvos {len(new_records)} novos registros em {filename}")
         
         self.update_nsr_display()
 
-    def format_afd_record(self, record, sn):
-        nsr = str(self.connected_devices[sn]["nsr_counter"]).zfill(9)
+    def extract_timestamp_from_afd(self, afd_line):
+        """Extrai timestamp de uma linha AFD para ordenação"""
+        try:
+            # O timestamp está após o NSR (posições 9-28)
+            timestamp_str = afd_line[9:28]  # 2025-07-23T15:27:56
+            return datetime.strptime(timestamp_str, "%Y-%m-%dT%H:%M:%S")
+        except:
+            return datetime.now()
+
+    def format_afd_record(self, record, sn, nsr_counter):
+        """Formata registro no padrão AFD"""
+        nsr = str(nsr_counter).zfill(9)
         
         time_str = record.get("time", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         try:
@@ -469,7 +547,8 @@ class EvoFacialServer:
     def update_devices_list(self):
         self.devices_listbox.delete(0, END)
         for sn, device in self.connected_devices.items():
-            self.devices_listbox.insert(END, f"{sn} - {device['ip']} - {device['last_seen']}")
+            info = f"{sn} - {device['ip']} - {device['last_seen']} - NSR: {device.get('nsr_counter', 1)}"
+            self.devices_listbox.insert(END, info)
 
     def update_nsr_display(self):
         for item in self.nsr_tree.get_children():
@@ -500,6 +579,7 @@ class EvoFacialServer:
 
     def on_close(self):
         self.save_nsr_counters()
+        self.save_logs_control()
         self.root.destroy()
 
 if __name__ == "__main__":
